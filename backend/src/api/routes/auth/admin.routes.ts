@@ -1,6 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { AuthService } from '@/services/auth/auth.service.js';
-import { AuthRequest, verifyToken } from '@/api/middlewares/auth.js';
+import { AuthRequest, verifyToken, verifyAdmin, requireRoot } from '@/api/middlewares/auth.js';
 import { TokenManager } from '@/infra/security/token.manager.js';
 import { AppError } from '@/utils/errors.js';
 import { successResponse } from '@/utils/response.js';
@@ -15,8 +15,12 @@ import {
   exchangeAdminSessionRequestSchema,
   type CreateAdminSessionResponse,
   type GetCurrentAdminSessionResponse,
+  createAdminSchema,
+  changeAdminPasswordSchema,
 } from '@insforge/shared-schemas';
 import logger from '@/utils/logger.js';
+import { appConfig } from '@/infra/config/app.config.js';
+import { adminService } from '@/services/admin/admin.service.js';
 
 const router = Router();
 const authService = AuthService.getInstance();
@@ -57,7 +61,7 @@ router.post('/sessions/exchange', async (req: Request, res: Response, next: Next
 });
 
 // POST /api/auth/admin/sessions - Create admin session (web only)
-router.post('/sessions', (req: Request, res: Response, next: NextFunction) => {
+router.post('/sessions', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const validationResult = createAdminSessionRequestSchema.safeParse(req.body);
     if (!validationResult.success) {
@@ -69,7 +73,7 @@ router.post('/sessions', (req: Request, res: Response, next: NextFunction) => {
     }
 
     const { username, password } = validationResult.data;
-    const result: CreateAdminSessionResponse = authService.adminLogin(username, password);
+    const result: CreateAdminSessionResponse = await authService.adminLogin(username, password);
 
     // Set refresh token as httpOnly cookie + CSRF token for web clients
     const tokenManager = TokenManager.getInstance();
@@ -89,15 +93,30 @@ router.post('/sessions', (req: Request, res: Response, next: NextFunction) => {
 router.get(
   '/sessions/current',
   verifyToken,
-  (req: AuthRequest, res: Response, next: NextFunction) => {
+  async (req: AuthRequest, res: Response, next: NextFunction) => {
     try {
       if (req.user?.role !== 'project_admin' || !req.user.id) {
         throw new AppError('Admin access required', 403, ERROR_CODES.AUTH_UNAUTHORIZED);
       }
 
+      // Determine the display name
+      let username: string | undefined;
+      if (req.user.id === 'local:admin') {
+        // Root admin: use the configured root admin username
+        username = appConfig.auth.rootAdminUsername || 'admin';
+      } else {
+        // DB admin: lookup by ID
+        // Note: You'll need to import adminService
+        const admin = await adminService.getAdminById(req.user.id);
+        if (admin) {
+          username = admin.username;
+        }
+      }
+
       const response: GetCurrentAdminSessionResponse = {
         admin: {
           sub: req.user.id,
+          username, // Add username field
         },
       };
 
@@ -166,5 +185,86 @@ router.post('/logout', (_req: Request, res: Response, next: NextFunction) => {
     next(error);
   }
 });
+
+// GET /api/auth/admin - List all admins (root only)
+router.get('/', requireRoot, async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const admins = await authService.listAdmins();
+    successResponse(res, { admins });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/auth/admin - Create new admin (root only)
+router.post('/', requireRoot, async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const validation = createAdminSchema.safeParse(req.body);
+    if (!validation.success) {
+      throw new AppError(
+        validation.error.issues.map((e) => `${e.path.join('.')}: ${e.message}`).join(', '),
+        400,
+        ERROR_CODES.INVALID_INPUT
+      );
+    }
+
+    const { username, password } = validation.data;
+    const admin = await authService.createAdmin(username, password, req.user?.id);
+    successResponse(res, { admin }, 201);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// DELETE /api/auth/admin/:username - Delete admin (root only, with self-deletion prevention)
+router.delete(
+  '/:username',
+  requireRoot,
+  async (req: AuthRequest, res: Response, next: NextFunction) => {
+    try {
+      const { username } = req.params;
+
+      // Prevent self-deletion
+      if (username === appConfig.auth.rootAdminUsername) {
+        throw new AppError('Cannot delete root admin', 400, ERROR_CODES.FORBIDDEN);
+      }
+
+      await authService.deleteAdmin(username, req.user?.id || '');
+      res.status(204).send();
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// POST /api/auth/admin/change-password - Change own password (any admin)
+router.post(
+  '/change-password',
+  verifyAdmin,
+  async (req: AuthRequest, res: Response, next: NextFunction) => {
+    try {
+      const validation = changeAdminPasswordSchema.safeParse(req.body);
+      if (!validation.success) {
+        throw new AppError(
+          validation.error.issues.map((e) => `${e.path.join('.')}: ${e.message}`).join(', '),
+          400,
+          ERROR_CODES.INVALID_INPUT
+        );
+      }
+
+      // Get admin ID from the authenticated token
+      const adminId = req.user?.id;
+      if (!adminId) {
+        throw new AppError('Unauthorized', 401, ERROR_CODES.AUTH_UNAUTHORIZED);
+      }
+
+      const { oldPassword, newPassword } = validation.data;
+      await authService.changeAdminPassword(adminId, oldPassword, newPassword);
+      successResponse(res, { message: 'Password changed successfully' });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
 
 export default router;

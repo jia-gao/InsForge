@@ -62,6 +62,7 @@ export const userSchema = z.object({
 
 export const adminSchema = z.object({
   sub: z.string().min(1),
+  username: z.string().optional(),
 });
 
 /**
